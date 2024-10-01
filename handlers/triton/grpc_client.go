@@ -243,7 +243,7 @@ func (tc *TritonClient) Serve() error {
 	// return nil
 
 	// Get concurrency from environment variable, default to 5 if not set
-	concurrency, err := strconv.Atoi(os.Getenv("TRITON_CONCURRENCY"))
+	concurrency, err := strconv.Atoi(viper.GetString("TRITON_CONCURRENCY"))
 	if err != nil || concurrency < 1 {
 		concurrency = 5
 	}
