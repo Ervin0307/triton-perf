@@ -40,7 +40,7 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		if err := h.EchoH.Start(":8000"); err != nil && err != http.ErrServerClosed {
+		if err := h.EchoH.Start(":11000"); err != nil && err != http.ErrServerClosed {
 			logger.Errorf("Error starting server: %v", err)
 		}
 	}()
