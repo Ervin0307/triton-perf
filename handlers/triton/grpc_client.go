@@ -29,7 +29,7 @@ type TritonClient struct {
 }
 
 var (
-	networkTimeout = 600.0
+	networkTimeout = 30.0
 )
 
 func serverLiveRequest(client grpcClient.GRPCInferenceServiceClient) (*grpcClient.ServerLiveResponse, error) {
@@ -81,7 +81,7 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 
 	audioArr := make([]float32, 0, 1000000)
 
-	start := time.Now()
+	// start := time.Now()
 	for {
 		n, err := decoder.PCMBuffer(tc.audioBuffer)
 		if err == io.EOF {
@@ -100,7 +100,7 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 			break
 		}
 	}
-	tc.Log.Infof("Total Time taken for reading audio: %v secs\n", time.Since(start).Seconds())
+	// tc.Log.Infof("Total Time taken for reading audio: %v secs\n", time.Since(start).Seconds())
 
 	return audioArr, int(format.SampleRate), nil
 }
@@ -140,13 +140,13 @@ func (tc *TritonClient) processAudio(audioFile string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(networkTimeout)*time.Second)
 	defer cancel()
 
-	start := time.Now()
+	// start := time.Now()
 	response, err := tc.client.ModelInfer(ctx, request)
 	if err != nil {
 		tc.Log.Error("Error processing InferRequest: ", err)
 		return err
 	}
-	tc.Log.Infof("Total Time taken for Inferece: %v secs\n", time.Since(start).Seconds())
+	// tc.Log.Infof("Total Time taken for Inferece: %v secs\n", time.Since(start).Seconds())
 
 	if len(response.RawOutputContents) > 0 {
 		tc.Log.Infof("Output: %s\n", response.RawOutputContents[0])
@@ -220,28 +220,6 @@ func (tc *TritonClient) Serve() error {
 		return err
 	}
 
-	// var wg sync.WaitGroup
-	// semaphore := make(chan struct{}, 5) // Limit concurrent goroutines, TODO: Make it configurable
-
-	// for _, audioFile := range audioFiles {
-	// 	wg.Add(1)
-	// 	semaphore <- struct{}{}
-	// 	go func(file string) {
-	// 		defer wg.Done()
-	// 		defer func() { <-semaphore }()
-
-	// 		start := time.Now()
-	// 		err := tc.processAudio(file)
-	// 		if err != nil {
-	// 			tc.Log.Errorf("Error processing %s: %v\n", file, err)
-	// 		}
-	// 		tc.Log.Infof("Total Time taken for %s: %v secs\n", file, time.Since(start).Seconds())
-	// 	}(audioFile)
-	// }
-
-	// wg.Wait()
-	// return nil
-
 	// Get concurrency from environment variable, default to 5 if not set
 	concurrency, err := strconv.Atoi(viper.GetString("TRITON_CONCURRENCY"))
 	if err != nil || concurrency < 1 {
@@ -254,19 +232,20 @@ func (tc *TritonClient) Serve() error {
 	wg.Add(concurrency)
 
 	for i := 0; i < concurrency; i++ {
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 
 			// Select a random audio file
-			file := audioFiles[i%len(audioFiles)]
+			file := audioFiles[workerID%len(audioFiles)]
 
 			start := time.Now()
 			err := tc.processAudio(file)
+			duration := time.Since(start)
 			if err != nil {
-				tc.Log.Errorf("Error processing %s: %v\n", file, err)
+				tc.Log.Errorf("Worker %d - Error processing %s: %v\n", workerID, file, err)
 			}
-			tc.Log.Infof("Total Time taken for %s: %v secs\n", file, time.Since(start).Seconds())
-		}()
+			tc.Log.Infof("Worker %d - Time taken for %s: %v\n", workerID, file, duration)
+		}(i)
 	}
 
 	wg.Wait()
