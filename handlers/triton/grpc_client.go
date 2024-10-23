@@ -9,6 +9,8 @@ import (
 	"time"
 	"unsafe"
 	"strconv"
+	"sort"
+	"math"
 
 	grpcClient "triton-benchmark/handlers/triton/grpc-client"
 	"triton-benchmark/pkg"
@@ -25,11 +27,10 @@ type TritonClient struct {
 
 	conn        *grpc.ClientConn
 	client      grpcClient.GRPCInferenceServiceClient
-	audioBuffer *audio.IntBuffer
 }
 
 var (
-	networkTimeout = 30.0
+	networkTimeout = 500.0
 )
 
 func serverLiveRequest(client grpcClient.GRPCInferenceServiceClient) (*grpcClient.ServerLiveResponse, error) {
@@ -70,20 +71,17 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 	decoder := wav.NewDecoder(f)
 	format := decoder.Format()
 
-	if tc.audioBuffer == nil {
-		tc.audioBuffer = &audio.IntBuffer{
-			Data:   make([]int, 8192),
-			Format: format,
-		}
-	} else {
-		tc.audioBuffer.Format = format
+	// Create a new buffer for each call instead of sharing one
+	audioBuffer := &audio.IntBuffer{
+		Data:   make([]int, 8192),
+		Format: format,
 	}
 
 	audioArr := make([]float32, 0, 1000000)
 
 	// start := time.Now()
 	for {
-		n, err := decoder.PCMBuffer(tc.audioBuffer)
+		n, err := decoder.PCMBuffer(audioBuffer)
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -93,10 +91,10 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 		for i := 0; i < n; i++ {
 			// Normalize audio data
 			// diving by 32768.0 to normalize the audio data to [-1, 1]
-			audioArr = append(audioArr, float32(tc.audioBuffer.Data[i])/32768.0)
+			audioArr = append(audioArr, float32(audioBuffer.Data[i])/32768.0)
 		}
 
-		if n < len(tc.audioBuffer.Data) {
+		if n < len(audioBuffer.Data) {
 			break
 		}
 	}
@@ -105,27 +103,30 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 	return audioArr, int(format.SampleRate), nil
 }
 
-func (tc *TritonClient) processAudio(audioFile string) error {
+	type latency struct {
+		start time.Time
+		duration time.Duration
+		end time.Time
+	}
+
+func (tc *TritonClient) processAudio(audioFile string) (*latency, error) {
 	audioArr, _, err := tc.readAudio(audioFile)
 	if err != nil {
 		tc.Log.Error("Error reading audio file: ", err)
-		return err
+		return nil, err
 	}
+
+	tc.Log.Infof("Processing audio file: %d\n", len(audioArr))
 
 	samplingRateArr := []uint16{18000}
 
 	request := &grpcClient.ModelInferRequest{
-		ModelName: "whisper",
+		ModelName: "whisper_batched",
 		Inputs: []*grpcClient.ModelInferRequest_InferInputTensor{
 			{
 				Name:     "INPUT0",
 				Datatype: "FP32",
-				Shape:    []int64{int64(len(audioArr))},
-			},
-			{
-				Name:     "INPUT1",
-				Datatype: "UINT16",
-				Shape:    []int64{int64(len(samplingRateArr))},
+				Shape:    []int64{1, int64(len(audioArr))},
 			},
 		},
 		Outputs: []*grpcClient.ModelInferRequest_InferRequestedOutputTensor{
@@ -140,19 +141,23 @@ func (tc *TritonClient) processAudio(audioFile string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(networkTimeout)*time.Second)
 	defer cancel()
 
-	// start := time.Now()
+	latencyInfo := latency{}
+	
+	latencyInfo.start = time.Now()
 	response, err := tc.client.ModelInfer(ctx, request)
 	if err != nil {
 		tc.Log.Error("Error processing InferRequest: ", err)
-		return err
+		return nil, err
 	}
+	latencyInfo.duration = time.Since(latencyInfo.start)
+	latencyInfo.end = time.Now()
 	// tc.Log.Infof("Total Time taken for Inferece: %v secs\n", time.Since(start).Seconds())
 
 	if len(response.RawOutputContents) > 0 {
-		tc.Log.Infof("Output: %s\n", response.RawOutputContents[0])
+		tc.Log.Debugf("Output: %s\n", response.RawOutputContents[0])
 	}
 
-	return nil
+	return &latencyInfo, nil
 }
 
 func float32SliceToBytes(slice []float32) []byte {
@@ -210,44 +215,135 @@ func (tc *TritonClient) GetConnectionState() connectivity.State {
 	return tc.conn.GetState()
 }
 
+
 func (tc *TritonClient) Serve() error {
-	// Server health checks...
+    // Server health checks...
 
-	audioPath := viper.GetString("AUDIO_PATH")
-	audioFiles, err := filepath.Glob(audioPath + "*.*")
-	if err != nil {
-		tc.Log.Errorf("Error getting audio files: %v\n", err)
-		return err
-	}
+    audioPath := viper.GetString("AUDIO_PATH")
+    audioFiles, err := filepath.Glob(audioPath + "*.*")
+    if err != nil {
+        tc.Log.Errorf("Error getting audio files: %v\n", err)
+        return err
+    }
 
-	// Get concurrency from environment variable, default to 5 if not set
-	concurrency, err := strconv.Atoi(viper.GetString("TRITON_CONCURRENCY"))
-	if err != nil || concurrency < 1 {
-		concurrency = 5
-	}
+    concurrency, err := strconv.Atoi(viper.GetString("TRITON_CONCURRENCY"))
+    if err != nil || concurrency < 1 {
+        concurrency = 5
+    }
 
-	tc.Log.Infof("Running benchmark with concurrency: %d\n", concurrency)
+    tc.Log.Infof("Running benchmark with concurrency: %d\n", concurrency)
 
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
+    // Create a channel to collect timing results
+    type processingResult struct {
+        workerID  int
+        file      string
+        duration  time.Duration
+        startTime time.Time
+        endTime   time.Time
+        err       error
+    }
+    results := make(chan processingResult, concurrency)
 
-	for i := 0; i < concurrency; i++ {
-		go func(workerID int) {
-			defer wg.Done()
+    // Start the workers
+    var wg sync.WaitGroup
+    wg.Add(concurrency)
 
-			// Select a random audio file
-			file := audioFiles[workerID%len(audioFiles)]
+    for i := 0; i < concurrency; i++ {
+        go func(workerID int) {
+            defer wg.Done()
 
-			start := time.Now()
-			err := tc.processAudio(file)
-			duration := time.Since(start)
-			if err != nil {
-				tc.Log.Errorf("Worker %d - Error processing %s: %v\n", workerID, file, err)
-			}
-			tc.Log.Infof("Worker %d - Time taken for %s: %v\n", workerID, file, duration)
-		}(i)
-	}
+            file := audioFiles[workerID%len(audioFiles)]
 
-	wg.Wait()
-	return nil
+            latencyInfo, err := tc.processAudio(file)
+            
+            results <- processingResult{
+                workerID:  workerID,
+                file:      file,
+                duration:  latencyInfo.duration,
+                startTime: latencyInfo.start,
+                endTime:   latencyInfo.end,
+                err:      err,
+            }
+        }(i)
+    }
+
+    // Start a goroutine to close results channel after all workers finish
+    go func() {
+        wg.Wait()
+        close(results)
+        tc.Log.Debug("All workers finished")
+    }()
+
+    // Collect and process results
+    var totalDuration time.Duration
+    var processedFiles int
+    startTimes := make(map[int]time.Time)
+    endTimes := make(map[int]time.Time)
+    var durations []time.Duration // Slice to store all durations for percentile calculation
+
+    for result := range results {
+        processedFiles++
+        totalDuration += result.duration
+        startTimes[result.workerID] = result.startTime
+        endTimes[result.workerID] = result.endTime
+        durations = append(durations, result.duration) // Store duration for percentile calculation
+
+        if result.err != nil {
+            tc.Log.Errorf("Worker %d - Error processing %s: %v\n", 
+                result.workerID, result.file, result.err)
+        } else {
+            tc.Log.Infof("Worker %d - Processed %s in %v (Started: %s, Finished: %s)\n",
+                result.workerID, 
+                result.file, 
+                result.duration,
+                result.startTime.Format("15:04:05.000"),
+                result.endTime.Format("15:04:05.000"))
+        }
+    }
+
+    // Calculate 99th percentile
+    p99 := calculatePercentile(durations, 99)
+
+    // Log summary statistics
+    tc.Log.Infof("Summary Statistics:")
+    tc.Log.Infof("Total files processed: %d", processedFiles)
+    tc.Log.Infof("Average processing time: %v", totalDuration/time.Duration(processedFiles))
+    tc.Log.Infof("99th percentile processing time: %v", p99)
+    
+    // Log individual worker statistics
+    for workerID := 0; workerID < concurrency; workerID++ {
+        if start, ok := startTimes[workerID]; ok {
+            if end, ok := endTimes[workerID]; ok {
+                tc.Log.Infof("Worker %d - Total running time: %v", 
+                    workerID, end.Sub(start))
+            }
+        }
+    }
+
+    return nil
+}
+
+// calculatePercentile calculates the nth percentile from a slice of durations
+func calculatePercentile(durations []time.Duration, n float64) time.Duration {
+    if len(durations) == 0 {
+        return 0
+    }
+    
+    // Sort durations
+    sort.Slice(durations, func(i, j int) bool {
+        return durations[i] < durations[j]
+    })
+    
+    // Calculate the index for the percentile
+    index := int(math.Ceil((n/100) * float64(len(durations)))) - 1
+    
+    // Ensure index is within bounds
+    if index < 0 {
+        index = 0
+    }
+    if index >= len(durations) {
+        index = len(durations) - 1
+    }
+    
+    return durations[index]
 }
