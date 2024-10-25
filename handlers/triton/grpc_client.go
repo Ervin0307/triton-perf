@@ -2,15 +2,17 @@ package triton
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
-	"strconv"
-	"sort"
-	"math"
 
 	grpcClient "triton-benchmark/handlers/triton/grpc-client"
 	"triton-benchmark/pkg"
@@ -27,6 +29,14 @@ type TritonClient struct {
 
 	conn        *grpc.ClientConn
 	client      grpcClient.GRPCInferenceServiceClient
+}
+
+type Output struct {
+	StartTime time.Time `json:"start_time"`
+	EndTime time.Time `json:"end_time"`
+	InferenceOutput string `json:"output"`
+	Duration time.Duration `json:"duration"`
+	FileName string `json:"file_name"`
 }
 
 var (
@@ -103,20 +113,21 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 	return audioArr, int(format.SampleRate), nil
 }
 
-	type latency struct {
+	type metadata struct {
 		start time.Time
 		duration time.Duration
 		end time.Time
+		output []byte
 	}
 
-func (tc *TritonClient) processAudio(audioFile string) (*latency, error) {
+func (tc *TritonClient) processAudio(audioFile string) (*metadata, error) {
 	audioArr, _, err := tc.readAudio(audioFile)
 	if err != nil {
 		tc.Log.Error("Error reading audio file: ", err)
 		return nil, err
 	}
 
-	tc.Log.Infof("Processing audio file: %d\n", len(audioArr))
+	// tc.Log.Infof("Processing audio file: %d\n", len(audioArr))
 
 	samplingRateArr := []uint16{18000}
 
@@ -141,23 +152,24 @@ func (tc *TritonClient) processAudio(audioFile string) (*latency, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(networkTimeout)*time.Second)
 	defer cancel()
 
-	latencyInfo := latency{}
+	metadata := metadata{}
 	
-	latencyInfo.start = time.Now()
+	metadata.start = time.Now()
 	response, err := tc.client.ModelInfer(ctx, request)
 	if err != nil {
 		tc.Log.Error("Error processing InferRequest: ", err)
 		return nil, err
 	}
-	latencyInfo.duration = time.Since(latencyInfo.start)
-	latencyInfo.end = time.Now()
+	metadata.duration = time.Since(metadata.start)
+	metadata.end = time.Now()
 	// tc.Log.Infof("Total Time taken for Inferece: %v secs\n", time.Since(start).Seconds())
 
 	if len(response.RawOutputContents) > 0 {
-		tc.Log.Debugf("Output: %s\n", response.RawOutputContents[0])
+		metadata.output = response.RawOutputContents[0]
+		tc.Log.Debugf("Output: %s\n", string(response.RawOutputContents[0]))
 	}
 
-	return &latencyInfo, nil
+	return &metadata, nil
 }
 
 func float32SliceToBytes(slice []float32) []byte {
@@ -241,6 +253,7 @@ func (tc *TritonClient) Serve() error {
         startTime time.Time
         endTime   time.Time
         err       error
+				output  []byte
     }
     results := make(chan processingResult, concurrency)
 
@@ -254,15 +267,16 @@ func (tc *TritonClient) Serve() error {
 
             file := audioFiles[workerID%len(audioFiles)]
 
-            latencyInfo, err := tc.processAudio(file)
+            metadata, err := tc.processAudio(file)
             
             results <- processingResult{
                 workerID:  workerID,
                 file:      file,
-                duration:  latencyInfo.duration,
-                startTime: latencyInfo.start,
-                endTime:   latencyInfo.end,
+                duration:  metadata.duration,
+                startTime: metadata.start,
+                endTime:   metadata.end,
                 err:      err,
+								output: metadata.output,
             }
         }(i)
     }
@@ -277,16 +291,23 @@ func (tc *TritonClient) Serve() error {
     // Collect and process results
     var totalDuration time.Duration
     var processedFiles int
-    startTimes := make(map[int]time.Time)
-    endTimes := make(map[int]time.Time)
     var durations []time.Duration // Slice to store all durations for percentile calculation
+
+		outputs := make(map[int]Output, 0)
 
     for result := range results {
         processedFiles++
         totalDuration += result.duration
-        startTimes[result.workerID] = result.startTime
-        endTimes[result.workerID] = result.endTime
+
         durations = append(durations, result.duration) // Store duration for percentile calculation
+
+				outputs[result.workerID] = Output{
+					StartTime: result.startTime,
+					EndTime: result.endTime,
+					InferenceOutput: string(result.output),
+					Duration: result.duration,
+					FileName: result.file,
+				}
 
         if result.err != nil {
             tc.Log.Errorf("Worker %d - Error processing %s: %v\n", 
@@ -312,15 +333,40 @@ func (tc *TritonClient) Serve() error {
     
     // Log individual worker statistics
     for workerID := 0; workerID < concurrency; workerID++ {
-        if start, ok := startTimes[workerID]; ok {
-            if end, ok := endTimes[workerID]; ok {
-                tc.Log.Infof("Worker %d - Total running time: %v", 
-                    workerID, end.Sub(start))
-            }
-        }
+			if op, ok := outputs[workerID]; ok {
+				tc.Log.Infof("Worker %d - Total running time: %v",  workerID, op.EndTime.Sub(op.StartTime))
+			}
     }
 
+		fmt.Println("length", len(outputs))
+
+		err = saveResult(outputs)
+		if err != nil {
+			tc.Log.Errorf("Error saving results: %v\n", err)
+		}
+
     return nil
+}
+
+func saveResult(outputs map[int]Output) error {
+	
+	if err := os.MkdirAll(viper.GetString("OUTPUT_PATH"), os.ModePerm); err != nil {
+		return err
+	}
+
+	f, err := os.Create(filepath.Join(viper.GetString("OUTPUT_PATH"), fmt.Sprintf("%s.json", time.Now().Format(time.RFC3339))))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	as_json, _ := json.MarshalIndent(outputs, "", "\t")
+	_, err = f.Write(as_json)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // calculatePercentile calculates the nth percentile from a slice of durations
