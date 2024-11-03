@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+	"encoding/binary"
 
 	grpcClient "triton-benchmark/handlers/triton/grpc-client"
 	"triton-benchmark/pkg"
@@ -35,12 +36,17 @@ type Output struct {
 	StartTime time.Time `json:"start_time"`
 	EndTime time.Time `json:"end_time"`
 	InferenceOutput string `json:"output"`
-	Duration time.Duration `json:"duration"`
+	Duration float32 `json:"duration"`
 	FileName string `json:"file_name"`
+	ActualOuput string `json:"actual_output"`
 }
 
 var (
-	networkTimeout = 500.0
+	networkTimeout = 5000.0	
+)
+
+const (
+	PADDING_SIZE = 48000
 )
 
 func serverLiveRequest(client grpcClient.GRPCInferenceServiceClient) (*grpcClient.ServerLiveResponse, error) {
@@ -69,6 +75,17 @@ func serverReadyRequest(client grpcClient.GRPCInferenceServiceClient) (*grpcClie
 		return nil, err
 	}
 	return serverReadyResponse, nil
+}
+
+func padAudio(audio []float32, targetSize int) []float32 {
+	if len(audio) >= targetSize {
+		return audio[:targetSize]
+	}
+
+	paddedAudio := make([]float32, targetSize)
+	copy(paddedAudio, audio)
+	// The rest of the array will be zero-padded by default in Go
+	return paddedAudio
 }
 
 func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) {
@@ -115,10 +132,17 @@ func (tc *TritonClient) readAudio(audioFilePath string) ([]float32, int, error) 
 
 	type metadata struct {
 		start time.Time
-		duration time.Duration
+		duration float32
 		end time.Time
 		output []byte
 	}
+
+	func bytesToFloat32(b []byte) float32 {
+	// Convert 4 bytes to float32
+	bits := binary.LittleEndian.Uint32(b)
+	float := math.Float32frombits(bits)
+	return float
+}
 
 func (tc *TritonClient) processAudio(audioFile string) (*metadata, error) {
 	audioArr, _, err := tc.readAudio(audioFile)
@@ -127,7 +151,9 @@ func (tc *TritonClient) processAudio(audioFile string) (*metadata, error) {
 		return nil, err
 	}
 
-	// tc.Log.Infof("Processing audio file: %d\n", len(audioArr))
+	// Pad the audio array to fixed length
+	paddedAudio := padAudio(audioArr, PADDING_SIZE)
+	tc.Log.Debugf("Original audio length: %d, Padded length: %d", len(audioArr), len(paddedAudio))
 
 	samplingRateArr := []uint16{18000}
 
@@ -137,14 +163,15 @@ func (tc *TritonClient) processAudio(audioFile string) (*metadata, error) {
 			{
 				Name:     "INPUT0",
 				Datatype: "FP32",
-				Shape:    []int64{1, int64(len(audioArr))},
+				Shape:    []int64{1, PADDING_SIZE}, // Use fixed size here
 			},
 		},
 		Outputs: []*grpcClient.ModelInferRequest_InferRequestedOutputTensor{
 			{Name: "OUTPUT0"},
+			{Name: "OUTPUT1"},
 		},
 		RawInputContents: [][]byte{
-			float32SliceToBytes(audioArr),
+			float32SliceToBytes(paddedAudio),
 			uint16SliceToBytes(samplingRateArr),
 		},
 	}
@@ -160,13 +187,17 @@ func (tc *TritonClient) processAudio(audioFile string) (*metadata, error) {
 		tc.Log.Error("Error processing InferRequest: ", err)
 		return nil, err
 	}
-	metadata.duration = time.Since(metadata.start)
 	metadata.end = time.Now()
-	// tc.Log.Infof("Total Time taken for Inferece: %v secs\n", time.Since(start).Seconds())
 
-	if len(response.RawOutputContents) > 0 {
+	if len(response.RawOutputContents) >= 2 {
+		// Process OUTPUT0 (transcription)
 		metadata.output = response.RawOutputContents[0]
-		tc.Log.Debugf("Output: %s\n", string(response.RawOutputContents[0]))
+		
+		// Process OUTPUT1 (server timing)
+		if len(response.RawOutputContents[1]) >= 4 { // float32 is 4 bytes
+			metadata.duration = bytesToFloat32(response.RawOutputContents[1])
+			tc.Log.Debugf("Server processing time: %f seconds", metadata.duration)
+		}
 	}
 
 	return &metadata, nil
@@ -249,13 +280,30 @@ func (tc *TritonClient) Serve() error {
     type processingResult struct {
         workerID  int
         file      string
-        duration  time.Duration
+        duration  float32
         startTime time.Time
         endTime   time.Time
         err       error
 				output  []byte
+				actualOutput string
     }
     results := make(chan processingResult, concurrency)
+
+		actualOutputs := make(map[string]string, 0)
+
+		// read file
+		f, err := os.Open("map.json")
+		if err != nil {
+			tc.Log.Error("Error reading actual_output.json file: ", err)
+			return err
+		}
+
+		decoder := json.NewDecoder(f)
+		err = decoder.Decode(&actualOutputs)
+		if err != nil {
+			tc.Log.Error("Error decoding actual_output.json file: ", err)
+			return err
+		}
 
     // Start the workers
     var wg sync.WaitGroup
@@ -266,8 +314,12 @@ func (tc *TritonClient) Serve() error {
             defer wg.Done()
 
             file := audioFiles[workerID%len(audioFiles)]
-
             metadata, err := tc.processAudio(file)
+
+						actualOp := ""
+						if actualOutput, ok := actualOutputs[filepath.Base(file)]; ok {
+							actualOp = actualOutput
+						}
             
             results <- processingResult{
                 workerID:  workerID,
@@ -277,6 +329,8 @@ func (tc *TritonClient) Serve() error {
                 endTime:   metadata.end,
                 err:      err,
 								output: metadata.output,
+								actualOutput: actualOp,
+
             }
         }(i)
     }
@@ -289,9 +343,9 @@ func (tc *TritonClient) Serve() error {
     }()
 
     // Collect and process results
-    var totalDuration time.Duration
+    var totalDuration float32
     var processedFiles int
-    var durations []time.Duration // Slice to store all durations for percentile calculation
+    var durations []float32 // Slice to store all durations for percentile calculation
 
 		outputs := make(map[int]Output, 0)
 
@@ -307,6 +361,7 @@ func (tc *TritonClient) Serve() error {
 					InferenceOutput: string(result.output),
 					Duration: result.duration,
 					FileName: result.file,
+					ActualOuput: result.actualOutput,
 				}
 
         if result.err != nil {
@@ -328,7 +383,7 @@ func (tc *TritonClient) Serve() error {
     // Log summary statistics
     tc.Log.Infof("Summary Statistics:")
     tc.Log.Infof("Total files processed: %d", processedFiles)
-    tc.Log.Infof("Average processing time: %v", totalDuration/time.Duration(processedFiles))
+    tc.Log.Infof("Average processing time: %v", totalDuration/(float32)(processedFiles))
     tc.Log.Infof("99th percentile processing time: %v", p99)
     
     // Log individual worker statistics
@@ -370,7 +425,7 @@ func saveResult(outputs map[int]Output) error {
 }
 
 // calculatePercentile calculates the nth percentile from a slice of durations
-func calculatePercentile(durations []time.Duration, n float64) time.Duration {
+func calculatePercentile(durations []float32, n float64) float32 {
     if len(durations) == 0 {
         return 0
     }
