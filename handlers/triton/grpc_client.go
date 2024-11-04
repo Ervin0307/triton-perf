@@ -46,7 +46,7 @@ var (
 )
 
 const (
-	PADDING_SIZE = 48000
+	PADDING_SIZE = 480000
 )
 
 func serverLiveRequest(client grpcClient.GRPCInferenceServiceClient) (*grpcClient.ServerLiveResponse, error) {
