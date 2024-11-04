@@ -47,14 +47,6 @@ if __name__ == "__main__":
     split = 'test'
     dataset = load_dataset(dataset_name, "en", split=split, trust_remote_code=True)
     print(dataset)
-    performance = {
-        'file name': [],
-        'audio length (s)': [],
-        'time taken (s)': [],
-        'transcribed text': [],
-        'actual text': [],
-        'accuracy': []
-    }
     initial_time = time.time()
     dir = "handlers/triton/audio"
     if not os.path.exists(dir):
