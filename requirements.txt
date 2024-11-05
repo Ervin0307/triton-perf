@@ -1,0 +1,5 @@
+soundfile
+librosa
+jiwer
+tritonclient[http]==2.41.0
+python-dateutil==2.9.0.post0
